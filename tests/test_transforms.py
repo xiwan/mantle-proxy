@@ -1,8 +1,12 @@
+import asyncio
+
 import pytest
+from aiohttp import web
 
 from mantle_proxy.server import (
     Config,
     ConfigError,
+    auth_middleware,
     chat_to_responses,
     maybe_parse_json_body,
     normalize_path,
@@ -46,6 +50,36 @@ def test_chat_to_responses_converts_function_tools():
             "parameters": {"type": "object"},
         }
     ]
+
+
+def test_chat_to_responses_converts_tool_choice_and_response_format():
+    request = {
+        "model": "openai.test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "lookup_response",
+                "description": "A lookup result",
+                "schema": {"type": "object"},
+                "strict": True,
+            },
+        },
+    }
+
+    converted = chat_to_responses(request, "fallback")
+
+    assert converted["tool_choice"] == {"type": "function", "name": "lookup"}
+    assert converted["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "lookup_response",
+            "description": "A lookup result",
+            "schema": {"type": "object"},
+            "strict": True,
+        }
+    }
 
 
 def test_responses_to_chat_maps_tool_calls_and_usage():
@@ -92,3 +126,45 @@ def test_maybe_parse_json_body_handles_missing_content_type():
     assert maybe_parse_json_body(b"not-json", "text/plain") is None
     with pytest.raises(ValueError):
         maybe_parse_json_body(b"not-json", "application/json")
+
+
+def test_auth_middleware_requires_matching_bearer_token():
+    request = FakeRequest({"Authorization": "Bearer wrong"})
+
+    response = asyncio.run(auth_middleware(request, ok_handler))
+
+    assert response.status == 401
+
+
+def test_auth_middleware_accepts_matching_bearer_token():
+    request = FakeRequest({"Authorization": "Bearer secret"})
+
+    response = asyncio.run(auth_middleware(request, ok_handler))
+
+    assert response.status == 204
+
+
+class FakeRequest:
+    def __init__(self, headers):
+        self.app = {"config": _config(proxy_api_key="secret")}
+        self.headers = headers
+
+
+async def ok_handler(request):
+    return web.Response(status=204)
+
+
+def _config(proxy_api_key=""):
+    return Config(
+        region="us-east-2",
+        aws_service="bedrock",
+        base_url="https://bedrock-mantle.us-east-2.api.aws/openai/v1",
+        host="127.0.0.1",
+        port=4010,
+        default_model="openai.gpt-5.5",
+        proxy_api_key=proxy_api_key,
+        allow_insecure_remote=False,
+        request_timeout_s=120.0,
+        max_body_bytes=20 * 1024 * 1024,
+        log_level="INFO",
+    )

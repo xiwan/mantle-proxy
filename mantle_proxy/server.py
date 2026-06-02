@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -192,8 +193,8 @@ async def error_middleware(request: web.Request, handler):
 async def auth_middleware(request: web.Request, handler):
     config: Config = request.app["config"]
     if config.proxy_api_key:
-        expected = f"Bearer {config.proxy_api_key}"
-        if request.headers.get("Authorization") != expected:
+        scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(token, config.proxy_api_key):
             return json_error(401, "unauthorized", "Missing or invalid proxy API key")
     return await handler(request)
 
@@ -299,12 +300,19 @@ def chat_to_responses(data: dict[str, Any], default_model: str) -> dict[str, Any
         "metadata": "metadata",
         "store": "store",
         "parallel_tool_calls": "parallel_tool_calls",
-        "tool_choice": "tool_choice",
         "user": "user",
     }
     for source, target in field_map.items():
         if source in data and data[source] is not None:
             out[target] = data[source]
+
+    if "tool_choice" in data and data["tool_choice"] is not None:
+        out["tool_choice"] = convert_tool_choice(data["tool_choice"])
+
+    if "response_format" in data and isinstance(data["response_format"], dict):
+        text_format = convert_response_format(data["response_format"])
+        if text_format:
+            out["text"] = {"format": text_format}
 
     if "reasoning" in data and isinstance(data["reasoning"], dict):
         out["reasoning"] = data["reasoning"]
@@ -407,6 +415,32 @@ def convert_tools(tools: Any) -> list[dict[str, Any]]:
             converted.append(response_tool)
         else:
             converted.append(tool)
+    return converted
+
+
+def convert_tool_choice(tool_choice: Any) -> Any:
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    if tool_choice.get("type") == "function" and isinstance(tool_choice.get("function"), dict):
+        return {"type": "function", "name": tool_choice["function"].get("name", "")}
+    return tool_choice
+
+
+def convert_response_format(response_format: dict[str, Any]) -> dict[str, Any] | None:
+    format_type = response_format.get("type")
+    if format_type in {"text", "json_object"}:
+        return {"type": format_type}
+    if format_type != "json_schema":
+        return None
+
+    json_schema = response_format.get("json_schema")
+    if not isinstance(json_schema, dict):
+        return response_format
+
+    converted: dict[str, Any] = {"type": "json_schema"}
+    for key in ("name", "description", "schema", "strict"):
+        if key in json_schema:
+            converted[key] = json_schema[key]
     return converted
 
 

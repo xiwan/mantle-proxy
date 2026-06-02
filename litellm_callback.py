@@ -15,9 +15,21 @@ from litellm.integrations.custom_logger import CustomLogger
 
 log = logging.getLogger("mantle_proxy.litellm_callback")
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("invalid_float_env name=%s using_default=%s", name, default)
+        return default
+
+
 CALLBACK_URL = os.getenv("ACP_BRIDGE_CALLBACK_URL", "http://127.0.0.1:18010/internal/llm-callback")
 CALLBACK_API_KEY = os.getenv("ACP_BRIDGE_CALLBACK_API_KEY", "")
-CALLBACK_TIMEOUT = float(os.getenv("ACP_BRIDGE_CALLBACK_TIMEOUT_SECONDS", "5"))
+CALLBACK_TIMEOUT = _env_float("ACP_BRIDGE_CALLBACK_TIMEOUT_SECONDS", 5.0)
 
 
 class AcpBridgeLogger(CustomLogger):
@@ -67,13 +79,17 @@ class AcpBridgeLogger(CustomLogger):
         headers = _headers()
         try:
             async with httpx.AsyncClient(timeout=CALLBACK_TIMEOUT) as client:
-                await client.post(CALLBACK_URL, json=payload, headers=headers)
+                response = await client.post(CALLBACK_URL, json=payload, headers=headers)
+                if response.status_code >= 400:
+                    log.warning("acp_bridge_callback_failed status=%s", response.status_code)
         except Exception as exc:
             log.warning("acp_bridge_callback_failed: %s", exc.__class__.__name__)
 
     def _post_sync(self, payload):
         try:
-            httpx.post(CALLBACK_URL, json=payload, headers=_headers(), timeout=CALLBACK_TIMEOUT)
+            response = httpx.post(CALLBACK_URL, json=payload, headers=_headers(), timeout=CALLBACK_TIMEOUT)
+            if response.status_code >= 400:
+                log.warning("acp_bridge_callback_failed status=%s", response.status_code)
         except Exception as exc:
             log.warning("acp_bridge_callback_failed: %s", exc.__class__.__name__)
 

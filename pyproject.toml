@@ -27,3 +27,4 @@ mantle-sigv4-proxy = "mantle_proxy.server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
