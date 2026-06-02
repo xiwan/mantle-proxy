@@ -1,4 +1,4 @@
-"""LiteLLM custom callback that posts usage data to ACP Bridge.
+"""Optional LiteLLM callback that posts usage data to ACP Bridge.
 
 The callback intentionally sends token counts and timing only. It does not send
 prompts, completions, request headers, API keys, or AWS credentials.
@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 from litellm.integrations.custom_logger import CustomLogger
 
-log = logging.getLogger("mantle_proxy.litellm_callback")
+log = logging.getLogger("mantle_proxy.integrations.acp_bridge")
 
 
 def _env_float(name: str, default: float) -> float:

@@ -8,8 +8,6 @@ The service accepts OpenAI-style requests on a local port, signs outgoing reques
 https://bedrock-mantle.<region>.api.aws/openai/v1
 ```
 
-It also includes a LiteLLM callback that records token usage in `acp-bridge` without sending prompts, completions, API keys, or AWS credentials.
-
 ## Features
 
 - SigV4 signing through the standard AWS credential provider chain.
@@ -39,7 +37,7 @@ For editable package install with the `mantle-sigv4-proxy` console command:
 pip install -e .
 ```
 
-Install LiteLLM callback dependencies only if you use the callback:
+Install LiteLLM callback dependencies only if you use an optional integration:
 
 ```bash
 pip install -r requirements-litellm.txt
@@ -140,11 +138,17 @@ AWS credentials are never configured in this repository. `botocore` reads creden
 
 For production, prefer short-lived credentials from SSO, STS, or instance roles. Avoid long-lived IAM user keys. Never commit `.env`, AWS credentials, LiteLLM keys, or proxy API keys.
 
-## LiteLLM Usage Callback
+## Optional Integrations
 
-`litellm_callback.py` provides a LiteLLM `CustomLogger` instance named `proxy_handler_instance`.
+The proxy does not require `acp-bridge`. The core service runs with only the configuration above.
 
-It posts usage counters to:
+An optional LiteLLM callback for ACP Bridge lives at:
+
+```text
+mantle_proxy/integrations/acp_bridge/litellm_callback.py
+```
+
+It provides a LiteLLM `CustomLogger` instance named `proxy_handler_instance`. When configured in LiteLLM, it posts usage counters to:
 
 ```text
 http://127.0.0.1:18010/internal/llm-callback
@@ -167,7 +171,7 @@ The callback sends only:
 - cache creation tokens
 - response time
 
-It does not send prompt text, completion text, request headers, API keys, or AWS credentials.
+It does not send prompt text, completion text, request headers, API keys, or AWS credentials. Leave this integration unconfigured if you do not use ACP Bridge.
 
 ## Compatibility Notes
 
@@ -201,7 +205,7 @@ Other supported tool types are passed through when their `type` is one of `funct
 Syntax check:
 
 ```bash
-python3 -m compileall mantle_proxy mantle-sigv4-proxy.py litellm_callback.py
+python3 -m compileall mantle_proxy mantle-sigv4-proxy.py
 ```
 
 Unit tests:

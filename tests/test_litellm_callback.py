@@ -12,7 +12,7 @@ def test_callback_timeout_falls_back_for_invalid_env(monkeypatch):
 
 def test_callback_logs_http_error_status(monkeypatch, caplog):
     module = load_callback(monkeypatch)
-    caplog.set_level(logging.WARNING, logger="mantle_proxy.litellm_callback")
+    caplog.set_level(logging.WARNING, logger="mantle_proxy.integrations.acp_bridge")
 
     module.AcpBridgeLogger()._post_sync({"model": "openai.test"})
 
@@ -29,8 +29,8 @@ def load_callback(monkeypatch, timeout="5"):
         "litellm.integrations.custom_logger",
         fake_custom_logger_module(),
     )
-    sys.modules.pop("litellm_callback", None)
-    return importlib.import_module("litellm_callback")
+    sys.modules.pop("mantle_proxy.integrations.acp_bridge.litellm_callback", None)
+    return importlib.import_module("mantle_proxy.integrations.acp_bridge.litellm_callback")
 
 
 def fake_httpx():
