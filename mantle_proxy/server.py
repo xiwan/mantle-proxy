@@ -145,6 +145,41 @@ class SigV4Client:
                      method.upper(), _safe_path(path), resp.status, elapsed_ms)
             return resp.status, raw, resp.headers.get("Content-Type", "application/json")
 
+    async def request_stream(self, method: str, path: str, body: bytes | None, query: str = ""):
+        """Streaming variant: yields chunks from upstream SSE response."""
+        url = self._target_url(path, query)
+        aws_headers = {"Accept": "text/event-stream"}
+        if body is not None:
+            aws_headers["Content-Type"] = "application/json"
+
+        credentials = self.aws_session.get_credentials()
+        if credentials is None:
+            raise UpstreamConfigError("AWS credentials were not found")
+
+        aws_req = AWSRequest(
+            method=method.upper(),
+            url=url,
+            data=body or b"",
+            headers=aws_headers,
+        )
+        SigV4Auth(
+            credentials.get_frozen_credentials(),
+            self.config.aws_service,
+            self.config.region,
+        ).add_auth(aws_req)
+
+        async with self.http.request(
+            method.upper(),
+            url,
+            data=body,
+            headers=dict(aws_req.headers),
+        ) as resp:
+            log.info("mantle_stream method=%s path=%s status=%s",
+                     method.upper(), _safe_path(path), resp.status)
+            yield resp.status, resp.headers.get("Content-Type", "text/event-stream")
+            async for chunk in resp.content.iter_any():
+                yield chunk
+
     def _target_url(self, path: str, query: str = "") -> str:
         normalized = normalize_path(path)
         url = f"{self.config.base_url}/{normalized}" if normalized else self.config.base_url
@@ -218,12 +253,16 @@ async def health(request: web.Request) -> web.Response:
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
     data = await read_json(request)
-    if data.get("stream"):
-        return json_error(501, "streaming_not_supported", "Streaming is not implemented by this proxy")
 
     config: Config = request.app["config"]
     client: SigV4Client = request.app["sigv4"]
     payload = chat_to_responses(data, config.default_model)
+
+    if data.get("stream"):
+        payload["stream"] = True
+        body = encode_json(payload)
+        return await _handle_stream(request, client, "responses", body)
+
     body = encode_json(payload)
     status, raw, content_type = await client.request("POST", "responses", body)
 
@@ -238,16 +277,20 @@ async def handle_passthrough(request: web.Request) -> web.Response:
     client: SigV4Client = request.app["sigv4"]
     body = await request.read()
     outbound_body: bytes | None = body or None
+    is_stream = False
 
     if body:
         data = maybe_parse_json_body(body, request.content_type)
         if isinstance(data, dict):
-            if data.get("stream"):
-                return json_error(501, "streaming_not_supported", "Streaming is not implemented by this proxy")
+            is_stream = bool(data.get("stream"))
             data = filter_tools(data)
             outbound_body = encode_json(data)
 
     path = request.match_info.get("path", "")
+
+    if is_stream:
+        return await _handle_stream(request, client, path, outbound_body)
+
     status, raw, content_type = await client.request(
         request.method,
         path,
@@ -255,6 +298,23 @@ async def handle_passthrough(request: web.Request) -> web.Response:
         request.query_string,
     )
     return web.Response(body=raw, status=status, content_type=_content_type(content_type))
+
+
+async def _handle_stream(request: web.Request, client: SigV4Client,
+                         path: str, body: bytes | None) -> web.StreamResponse:
+    stream_gen = client.request_stream(request.method, path, body, request.query_string)
+    header = await stream_gen.__anext__()
+    status, content_type = header
+
+    resp = web.StreamResponse(status=status, headers={"Content-Type": _content_type(content_type)})
+    resp.enable_chunked_encoding()
+    await resp.prepare(request)
+
+    async for chunk in stream_gen:
+        await resp.write(chunk)
+
+    await resp.write_eof()
+    return resp
 
 
 def maybe_parse_json_body(body: bytes, content_type: str) -> Any:
