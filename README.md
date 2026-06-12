@@ -11,11 +11,13 @@ https://bedrock-mantle.<region>.api.aws/openai/v1
 ## Features
 
 - SigV4 signing through the standard AWS credential provider chain.
-- `/chat/completions` and `/v1/chat/completions` translation to `/responses`.
+- `/chat/completions` → OpenAI models route to `/responses`, others pass through to Mantle Chat Completions.
+- `/anthropic/` path routes to Bedrock Mantle Anthropic Messages API (Claude + workspace cost tracking).
+- Per-request region override via `X-Mantle-Region` header.
+- Forwards `OpenAI-Project`, `anthropic-workspace`, `anthropic-version` headers for Project/Workspace cost tracking.
 - Passthrough for other Mantle OpenAI-compatible paths, including `/v1/responses`.
 - Optional local proxy API key for non-local deployments.
 - Safe defaults: listens on `127.0.0.1`, does not forward client `Authorization` headers, and does not log request or response bodies.
-- Explicitly rejects `stream: true` until streaming translation is implemented.
 
 ## Requirements
 
@@ -42,6 +44,30 @@ Install LiteLLM callback dependencies only if you use an optional integration:
 ```bash
 pip install -r requirements-litellm.txt
 ```
+
+## LiteLLM Integration
+
+This repo also hosts the LiteLLM proxy configuration used by the [acp-bridge](https://github.com/xiwan/acp-bridge) stack:
+
+| File | Purpose |
+|------|---------|
+| `litellm-config.yaml` | Model registry — maps model names to Bedrock/Mantle backends. No secrets (master key read from `LITELLM_API_KEY` env var). |
+| `litellm_callback.py` | Custom callback that posts token usage to acp-bridge and patches Fable 5 thinking params. |
+
+The systemd `litellm.service` points `--config` and `WorkingDirectory` to this repo so LiteLLM can load both files at startup.
+
+### Adding a model
+
+Append to `litellm-config.yaml` under `model_list`:
+
+```yaml
+  - model_name: "bedrock/<model-id>"
+    litellm_params:
+      model: "bedrock/<model-id>"
+      aws_region_name: "us-east-1"
+```
+
+Then `sudo systemctl restart litellm`.
 
 ## Configuration
 
