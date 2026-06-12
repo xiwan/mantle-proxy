@@ -18,10 +18,12 @@ from botocore.exceptions import BotoCoreError
 from botocore.session import Session
 
 SUPPORTED_TOOL_TYPES = {"function", "mcp", "custom", "namespace", "tool_search"}
-DEFAULT_REGION = "us-east-2"
+DEFAULT_REGION = "us-east-1"
 DEFAULT_PORT = 4010
 DEFAULT_MODEL = "openai.gpt-5.5"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+FORWARD_HEADERS = {"openai-project", "openai-organization", "anthropic-workspace", "anthropic-version"}
+REGION_OVERRIDE_HEADER = "x-mantle-region"
 
 log = logging.getLogger("mantle_proxy")
 
@@ -110,11 +112,16 @@ class SigV4Client:
         self.http = http
         self.aws_session = Session()
 
-    async def request(self, method: str, path: str, body: bytes | None, query: str = ""):
-        url = self._target_url(path, query)
+    async def request(self, method: str, path: str, body: bytes | None, query: str = "",
+                      extra_headers: dict[str, str] | None = None,
+                      region_override: str | None = None):
+        url = self._target_url(path, query, region_override)
+        region = region_override or self.config.region
         aws_headers = {"Accept": "application/json"}
         if body is not None:
             aws_headers["Content-Type"] = "application/json"
+        if extra_headers:
+            aws_headers.update(extra_headers)
 
         credentials = self.aws_session.get_credentials()
         if credentials is None:
@@ -129,7 +136,7 @@ class SigV4Client:
         SigV4Auth(
             credentials.get_frozen_credentials(),
             self.config.aws_service,
-            self.config.region,
+            region,
         ).add_auth(aws_req)
 
         started = time.monotonic()
@@ -145,12 +152,17 @@ class SigV4Client:
                      method.upper(), _safe_path(path), resp.status, elapsed_ms)
             return resp.status, raw, resp.headers.get("Content-Type", "application/json")
 
-    async def request_stream(self, method: str, path: str, body: bytes | None, query: str = ""):
+    async def request_stream(self, method: str, path: str, body: bytes | None, query: str = "",
+                             extra_headers: dict[str, str] | None = None,
+                             region_override: str | None = None):
         """Streaming variant: yields chunks from upstream SSE response."""
-        url = self._target_url(path, query)
+        url = self._target_url(path, query, region_override)
+        region = region_override or self.config.region
         aws_headers = {"Accept": "text/event-stream"}
         if body is not None:
             aws_headers["Content-Type"] = "application/json"
+        if extra_headers:
+            aws_headers.update(extra_headers)
 
         credentials = self.aws_session.get_credentials()
         if credentials is None:
@@ -165,7 +177,7 @@ class SigV4Client:
         SigV4Auth(
             credentials.get_frozen_credentials(),
             self.config.aws_service,
-            self.config.region,
+            region,
         ).add_auth(aws_req)
 
         async with self.http.request(
@@ -180,9 +192,17 @@ class SigV4Client:
             async for chunk in resp.content.iter_any():
                 yield chunk
 
-    def _target_url(self, path: str, query: str = "") -> str:
+    def _target_url(self, path: str, query: str = "", region_override: str | None = None) -> str:
+        region = region_override or self.config.region
         normalized = normalize_path(path)
-        url = f"{self.config.base_url}/{normalized}" if normalized else self.config.base_url
+        # Anthropic Messages API uses a different base path
+        if normalized.startswith("anthropic/"):
+            base = f"https://bedrock-mantle.{region}.api.aws"
+        elif region_override:
+            base = f"https://bedrock-mantle.{region}.api.aws/openai/v1"
+        else:
+            base = self.config.base_url
+        url = f"{base}/{normalized}" if normalized else base
         if query:
             url = f"{url}?{query}"
         return url
@@ -241,6 +261,13 @@ def json_error(status: int, code: str, message: str) -> web.Response:
     )
 
 
+def _extract_forward_headers(request: web.Request) -> tuple[dict[str, str] | None, str | None]:
+    """Extract client headers to forward and optional region override."""
+    fwd = {k: v for k, v in request.headers.items() if k.lower() in FORWARD_HEADERS}
+    region = request.headers.get(REGION_OVERRIDE_HEADER)
+    return fwd or None, region
+
+
 async def health(request: web.Request) -> web.Response:
     config: Config = request.app["config"]
     return web.json_response({
@@ -256,21 +283,34 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     config: Config = request.app["config"]
     client: SigV4Client = request.app["sigv4"]
-    payload = chat_to_responses(data, config.default_model)
+    fwd, region = _extract_forward_headers(request)
+    model = data.get("model") or config.default_model
 
-    if data.get("stream"):
-        payload["stream"] = True
+    # OpenAI models only support Responses API; others support Chat Completions natively
+    if model.startswith("openai."):
+        payload = chat_to_responses(data, config.default_model)
+        if data.get("stream"):
+            payload["stream"] = True
+            body = encode_json(payload)
+            return await _handle_stream(request, client, "responses", body,
+                                        extra_headers=fwd, region_override=region)
         body = encode_json(payload)
-        return await _handle_stream(request, client, "responses", body)
+        status, raw, content_type = await client.request("POST", "responses", body,
+                                                         extra_headers=fwd, region_override=region)
+        if status < 200 or status >= 300:
+            return web.Response(body=raw, status=status, content_type=_content_type(content_type))
+        upstream = json.loads(raw)
+        return web.json_response(responses_to_chat(upstream, config.default_model))
 
-    body = encode_json(payload)
-    status, raw, content_type = await client.request("POST", "responses", body)
-
-    if status < 200 or status >= 300:
-        return web.Response(body=raw, status=status, content_type=_content_type(content_type))
-
-    upstream = json.loads(raw)
-    return web.json_response(responses_to_chat(upstream, config.default_model))
+    # All other models: pass through to Chat Completions endpoint
+    data = filter_tools(data)
+    body = encode_json(data)
+    if data.get("stream"):
+        return await _handle_stream(request, client, "chat/completions", body,
+                                    extra_headers=fwd, region_override=region)
+    status, raw, content_type = await client.request("POST", "chat/completions", body,
+                                                     extra_headers=fwd, region_override=region)
+    return web.Response(body=raw, status=status, content_type=_content_type(content_type))
 
 
 async def handle_passthrough(request: web.Request) -> web.Response:
@@ -287,22 +327,30 @@ async def handle_passthrough(request: web.Request) -> web.Response:
             outbound_body = encode_json(data)
 
     path = request.match_info.get("path", "")
+    fwd, region = _extract_forward_headers(request)
 
     if is_stream:
-        return await _handle_stream(request, client, path, outbound_body)
+        return await _handle_stream(request, client, path, outbound_body,
+                                    extra_headers=fwd, region_override=region)
 
     status, raw, content_type = await client.request(
         request.method,
         path,
         outbound_body,
         request.query_string,
+        extra_headers=fwd,
+        region_override=region,
     )
     return web.Response(body=raw, status=status, content_type=_content_type(content_type))
 
 
 async def _handle_stream(request: web.Request, client: SigV4Client,
-                         path: str, body: bytes | None) -> web.StreamResponse:
-    stream_gen = client.request_stream(request.method, path, body, request.query_string)
+                         path: str, body: bytes | None,
+                         extra_headers: dict[str, str] | None = None,
+                         region_override: str | None = None) -> web.StreamResponse:
+    stream_gen = client.request_stream(request.method, path, body, request.query_string,
+                                       extra_headers=extra_headers,
+                                       region_override=region_override)
     header = await stream_gen.__anext__()
     status, content_type = header
 
