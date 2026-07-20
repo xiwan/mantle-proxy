@@ -358,11 +358,34 @@ async def _handle_stream(request: web.Request, client: SigV4Client,
     resp.enable_chunked_encoding()
     await resp.prepare(request)
 
+    buf = b""
     async for chunk in stream_gen:
-        await resp.write(chunk)
+        buf += chunk
+        # Process complete SSE blocks (separated by \n\n)
+        while b"\n\n" in buf:
+            block, buf = buf.split(b"\n\n", 1)
+            await resp.write(_reorder_sse_block(block) + b"\n\n")
+    if buf:
+        await resp.write(_reorder_sse_block(buf) + b"\n\n")
 
     await resp.write_eof()
     return resp
+
+
+def _reorder_sse_block(block: bytes) -> bytes:
+    """Reorder SSE fields so event: comes before data: (OpenAI standard order)."""
+    lines = block.split(b"\n")
+    event_lines = []
+    data_lines = []
+    other_lines = []
+    for line in lines:
+        if line.startswith(b"event:"):
+            event_lines.append(line)
+        elif line.startswith(b"data:"):
+            data_lines.append(line)
+        else:
+            other_lines.append(line)
+    return b"\n".join(event_lines + data_lines + other_lines)
 
 
 def maybe_parse_json_body(body: bytes, content_type: str) -> Any:
@@ -553,6 +576,7 @@ def convert_response_format(response_format: dict[str, Any]) -> dict[str, Any] |
 
 
 def filter_tools(data: dict[str, Any]) -> dict[str, Any]:
+    data = normalize_responses_input(data)
     if "tools" not in data:
         return data
     copied = dict(data)
@@ -561,6 +585,36 @@ def filter_tools(data: dict[str, Any]) -> dict[str, Any]:
         copied["tools"] = tools
     else:
         copied.pop("tools", None)
+    return copied
+
+
+def normalize_responses_input(data: dict[str, Any]) -> dict[str, Any]:
+    """Hoist Codex 'additional_tools' input items into the top-level tools array.
+
+    Codex >= 0.144 injects {"type": "additional_tools", "role": "developer",
+    "tools": [...]} into `input` (collaboration mode). Upstream OpenAI accepts
+    this, but Bedrock Mantle's Responses API rejects it with
+    "Invalid 'input': value did not match any expected variant".
+    Mantle does accept the same tools in the top-level `tools` array.
+    """
+    items = data.get("input")
+    if not isinstance(items, list):
+        return data
+    extra_tools: list[Any] = []
+    new_input: list[Any] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            tools = item.get("tools")
+            if isinstance(tools, list):
+                extra_tools.extend(tools)
+        else:
+            new_input.append(item)
+    if not extra_tools:
+        return data
+    copied = dict(data)
+    copied["input"] = new_input
+    existing = copied.get("tools")
+    copied["tools"] = (existing if isinstance(existing, list) else []) + extra_tools
     return copied
 
 

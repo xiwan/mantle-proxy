@@ -8,8 +8,10 @@ from mantle_proxy.server import (
     ConfigError,
     auth_middleware,
     chat_to_responses,
+    filter_tools,
     maybe_parse_json_body,
     normalize_path,
+    normalize_responses_input,
     responses_to_chat,
 )
 
@@ -168,3 +170,57 @@ def _config(proxy_api_key=""):
         max_body_bytes=20 * 1024 * 1024,
         log_level="INFO",
     )
+
+
+def test_normalize_responses_input_hoists_additional_tools():
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "custom", "name": "exec", "description": "run", "format": {}},
+                    {"type": "function", "name": "wait", "description": "", "strict": False,
+                     "parameters": {"type": "object", "properties": {}}},
+                ],
+            },
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+        ],
+    }
+    result = normalize_responses_input(data)
+    assert all(i.get("type") != "additional_tools" for i in result["input"])
+    assert len(result["input"]) == 1
+    assert [t["name"] for t in result["tools"]] == ["exec", "wait"]
+    # original untouched
+    assert len(data["input"]) == 2
+
+
+def test_normalize_responses_input_merges_existing_tools():
+    data = {
+        "input": [
+            {"type": "additional_tools", "role": "developer",
+             "tools": [{"type": "custom", "name": "exec"}]},
+        ],
+        "tools": [{"type": "function", "name": "existing"}],
+    }
+    result = normalize_responses_input(data)
+    assert [t["name"] for t in result["tools"]] == ["existing", "exec"]
+
+
+def test_normalize_responses_input_noop_without_additional_tools():
+    data = {"input": [{"type": "message", "role": "user", "content": "hi"}]}
+    assert normalize_responses_input(data) is data
+
+
+def test_filter_tools_handles_additional_tools_in_input():
+    data = {
+        "input": [
+            {"type": "additional_tools", "role": "developer",
+             "tools": [{"type": "custom", "name": "exec"}]},
+        ],
+    }
+    result = filter_tools(data)
+    assert result["tools"] == [{"type": "custom", "name": "exec"}]
+    assert result["input"] == []
