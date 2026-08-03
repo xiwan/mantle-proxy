@@ -45,11 +45,16 @@ CHAT_COMPLETIONS_STREAM = [
 
 ANTHROPIC_STREAM = [
     b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1",'
-    b'"usage":{"input_tokens":45,"cache_read_input_tokens":3626,'
-    b'"cache_creation_input_tokens":0,"output_tokens":1}}}\n\n',
+    b'"usage":{"input_tokens":17,"cache_creation_input_tokens":0,'
+    b'"cache_read_input_tokens":12400,"cache_creation":'
+    b'{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},'
+    b'"output_tokens":1,"service_tier":"standard"}}}\n\n',
     b'event: content_block_delta\ndata: {"type":"content_block_delta",'
     b'"delta":{"text":"hi"}}\n\n',
-    b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":12}}\n\n',
+    # Real message_delta repeats the input side alongside the final output count.
+    b'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":17,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":12400,'
+    b'"output_tokens":4}}\n\n',
 ]
 
 
@@ -141,14 +146,30 @@ def test_extract_usage_from_chat_completions_final_chunk():
 
 
 def test_extract_usage_from_anthropic_message_start():
+    """The sniffer keeps the LAST usage seen, which on Anthropic is message_delta."""
     _, usage = _run_loop_with_sniff(ANTHROPIC_STREAM)
-    assert usage["cache_read_input_tokens"] == 3626
+    assert usage["cache_read_input_tokens"] == 12400
+    # message_delta repeats the input side, so the final output count is kept too.
+    assert usage["output_tokens"] == 4
+
+    norm = normalize_cache_usage(usage)
+    assert norm["total_input_tokens"] == 17 + 12400   # exclusive semantics
+    assert norm["fresh_input_tokens"] == 17
+    assert norm["output_tokens"] == 4
 
 
-def test_extract_usage_ignores_output_only_usage():
-    """Anthropic message_delta carries output_tokens only; useless for cache rate."""
+def test_extract_usage_ignores_usage_without_input_side():
+    """A usage payload with no input-token field carries nothing for cache rate.
+
+    Real Bedrock Mantle Anthropic message_delta does include input_tokens (see
+    ANTHROPIC_STREAM), so this is a defensive guard rather than an observed case:
+    an output-only usage object must not clobber a complete one seen earlier.
+    """
     block = b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":12}}'
     assert extract_usage_from_sse_block(block) is None
+
+    complete = {"input_tokens": 17, "cache_read_input_tokens": 12400, "output_tokens": 4}
+    assert _sniff_usage(block, complete) is complete
 
 
 def test_extract_usage_handles_multiline_data_field():
@@ -464,3 +485,57 @@ def test_output_tokens_details_does_not_disturb_normalisation():
     ))
     assert norm["output_tokens"] == 58
     assert norm["fresh_input_tokens"] == 2
+
+
+# Verbatim non-streaming usage from anthropic.claude-haiku-4-5 via
+# /anthropic/v1/messages. Note input_tokens EXCLUDES the cache counts, the
+# opposite of the Responses API.
+REAL_ANTHROPIC_COLD = {
+    "input_tokens": 17, "cache_creation_input_tokens": 12400,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {"ephemeral_5m_input_tokens": 12400, "ephemeral_1h_input_tokens": 0},
+    "output_tokens": 4, "service_tier": "standard",
+}
+REAL_ANTHROPIC_WARM = {
+    "input_tokens": 17, "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 12400,
+    "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0},
+    "output_tokens": 4, "service_tier": "standard",
+}
+
+
+@pytest.mark.parametrize("usage,cached,write,hit", [
+    (REAL_ANTHROPIC_COLD, 0, 12400, 0),
+    (REAL_ANTHROPIC_WARM, 12400, 0, 1),
+])
+def test_real_anthropic_usage_uses_exclusive_denominator(usage, cached, write, hit):
+    norm = normalize_cache_usage(usage)
+    assert norm["cached_tokens"] == cached
+    assert norm["cache_write_tokens"] == write
+    assert norm["cache_hit"] == hit
+    # 17 + 12400: treating input_tokens as the denominator would report a
+    # cache rate of ~73000% instead of 99.9%.
+    assert norm["total_input_tokens"] == 12417
+    assert norm["fresh_input_tokens"] == 17
+    assert norm["output_tokens"] == 4
+
+
+def test_real_anthropic_cache_rate_matches_observed_run():
+    """cold + warm + streaming, as logged by the proxy on 2026-08-03."""
+    norms = [normalize_cache_usage(u) for u in
+             (REAL_ANTHROPIC_COLD, REAL_ANTHROPIC_WARM, REAL_ANTHROPIC_WARM)]
+    read = sum(n["cached_tokens"] for n in norms)
+    write = sum(n["cache_write_tokens"] for n in norms)
+    fresh = sum(n["fresh_input_tokens"] for n in norms)
+    hits = sum(n["cache_hit"] for n in norms)
+
+    assert read + write + fresh == 12417 * 3
+    assert (read, write, fresh, hits) == (24800, 12400, 51, 2)
+    assert read / (read + write + fresh) == pytest.approx(24800 / 37251)
+    assert hits / len(norms) == pytest.approx(2 / 3)
+
+
+def test_anthropic_cache_creation_ttl_split_is_ignored_safely():
+    """cache_creation.{ephemeral_5m,1h}_input_tokens must not be double-counted."""
+    norm = normalize_cache_usage(REAL_ANTHROPIC_COLD)
+    assert norm["cache_write_tokens"] == 12400  # not 24800

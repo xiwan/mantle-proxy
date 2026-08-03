@@ -220,10 +220,11 @@ Non-streaming `/chat/completions` responses for OpenAI models additionally carry
 the cache detail through to the client as `usage.prompt_tokens_details`, so
 downstream consumers such as LiteLLM can read it.
 
-Known limitation: on Anthropic streaming, `message_start` carries the input and
-cache counts while `message_delta` carries only `output_tokens`. The sniffer keeps
-the former, so `output_tokens` is under-reported for that path. Cache accounting
-is unaffected because it is input-side.
+On Anthropic streaming, `message_start` and `message_delta` both carry the full
+usage object — `input_tokens`, `cache_read_input_tokens` and
+`cache_creation_input_tokens` are repeated on `message_delta` alongside the final
+`output_tokens`. The sniffer keeps the last usage it sees, so both cache
+accounting and `output_tokens` are accurate on that path.
 
 ## Client Authentication
 
@@ -332,6 +333,15 @@ Observed against `bedrock-mantle.us-east-1.api.aws` with `openai.gpt-5.6-sol`
 - `max_output_tokens` has a minimum of `16` for `openai.gpt-5.6-sol`; lower values
   are rejected with `integer_below_min_value`.
 - SigV4 with service name `bedrock` (the `MANTLE_AWS_SERVICE` default) is accepted.
+- Anthropic Messages (`anthropic.claude-haiku-4-5`) reports cache activity as
+  top-level `cache_read_input_tokens` / `cache_creation_input_tokens`, and
+  `input_tokens` **excludes** both — the opposite of the Responses API. Observed
+  `input_tokens: 17` with `cache_read_input_tokens: 12400`, so the denominator is
+  `17 + 12400`. The payload also carries `cache_creation.ephemeral_5m_input_tokens`
+  / `ephemeral_1h_input_tokens` (TTL split) and `service_tier`.
+- On Anthropic streaming both `message_start` and `message_delta` carry the full
+  usage object; `message_delta` repeats `input_tokens` and the cache fields
+  alongside the final `output_tokens`.
 - Anthropic models may be unavailable from some locations, returning
   `invalid_request_error: Access to Anthropic models is not allowed from
   unsupported countries, regions, or territories`. This is independent of the AWS
