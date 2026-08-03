@@ -13,7 +13,9 @@ https://bedrock-mantle.<region>.api.aws/openai/v1
 - SigV4 signing through the standard AWS credential provider chain.
 - `/chat/completions` → OpenAI models route to `/responses`, others pass through to Mantle Chat Completions.
 - `/anthropic/` path routes to Bedrock Mantle Anthropic Messages API (Claude + workspace cost tracking).
-- Per-request region override via `X-Mantle-Region` header.
+- Streaming (`stream: true`) is supported on all routes as an SSE pass-through. See [Streaming](#streaming) for the protocol caveat.
+- Prompt cache observability: read-only usage sniffing on both streaming and non-streaming paths, optionally emitted as CloudWatch metrics. See [Prompt Cache Observability](#prompt-cache-observability).
+- Per-request region override via `X-Mantle-Region` header, validated against canonical AWS region codes.
 - Forwards `OpenAI-Project`, `anthropic-workspace`, `anthropic-version` headers for Project/Workspace cost tracking.
 - Passthrough for other Mantle OpenAI-compatible paths, including `/v1/responses`.
 - Optional local proxy API key for non-local deployments.
@@ -56,6 +58,15 @@ This repo also hosts the LiteLLM proxy configuration used by the [acp-bridge](ht
 
 The systemd `litellm.service` points `--config` and `WorkingDirectory` to this repo so LiteLLM can load both files at startup.
 
+### Environment variables read by `litellm-config.yaml`
+
+These are consumed by LiteLLM, not by the proxy:
+
+| Variable | Notes |
+|----------|-------|
+| `LITELLM_API_KEY` | LiteLLM master key. |
+| `MANTLE_PROJECT_ID` | Injected as the `OpenAI-Project` / `anthropic-workspace` header on Mantle-backed models for Project and Workspace cost tracking. |
+
 ### Adding a model
 
 Append to `litellm-config.yaml` under `model_list`:
@@ -89,14 +100,18 @@ Important variables:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `MANTLE_AWS_REGION` | `us-east-2` | AWS region used for endpoint and SigV4 scope. |
+| `MANTLE_AWS_REGION` | `us-east-1` | AWS region used for endpoint and SigV4 scope. `.env.example` ships `us-east-2`; the built-in code default is `us-east-1`. |
 | `MANTLE_AWS_SERVICE` | `bedrock` | SigV4 service name. |
 | `MANTLE_BASE_URL` | region-derived Mantle URL | Override for custom endpoints. |
 | `MANTLE_PROXY_HOST` | `127.0.0.1` | Keep localhost unless you have external auth and network controls. |
 | `MANTLE_PROXY_PORT` | `4010` | Listening port. |
 | `MANTLE_DEFAULT_MODEL` | `openai.gpt-5.5` | Used when the client omits `model`. |
 | `MANTLE_PROXY_API_KEY` | empty | Optional bearer token required by this proxy. |
-| `MANTLE_LOG_LEVEL` | `INFO` | Logs method, path, status, and timing only. |
+| `MANTLE_REQUEST_TIMEOUT_SECONDS` | `120` | Total upstream request timeout. |
+| `MANTLE_MAX_BODY_BYTES` | `20971520` | Max accepted request body size. |
+| `MANTLE_CACHE_METRICS` | `log` | Prompt cache observability mode: `off`, `log`, or `emf`. Invalid values fail at startup. |
+| `MANTLE_ALLOW_INSECURE_REMOTE` | `false` | Escape hatch for binding a remote interface without an API key. |
+| `MANTLE_LOG_LEVEL` | `INFO` | Logs method, path, status, timing, and cache token counts only. |
 
 ## Run
 
@@ -131,6 +146,84 @@ curl http://127.0.0.1:4010/v1/responses \
     "input": "Say hello in one sentence."
   }'
 ```
+
+## Prompt Cache Observability
+
+Bedrock Mantle publishes **no cache metric to CloudWatch**. The `AWS/BedrockMantle`
+namespace has `Inferences`, `InferenceClientErrors`, `TotalInputTokens`,
+`TotalOutputTokens`, `InputTokens`, and `OutputTokens` — nothing cache-specific.
+(`bedrock-runtime`'s `AWS/Bedrock` namespace does have `CacheReadInputTokenCount`
+and `CacheWriteInputTokenCount`, but this proxy does not use that endpoint.)
+
+The response `usage` object is therefore the only authoritative source. This proxy
+sniffs it read-only and emits counters. Sniffing never modifies the bytes forwarded
+to the client and never raises.
+
+Set the mode with `MANTLE_CACHE_METRICS`:
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` | No emission. |
+| `log` | Default. One structured log line per request. No behaviour change. |
+| `emf` | Embedded Metric Format on stdout, for pickup by the CloudWatch agent. |
+
+`log` output:
+
+```text
+cache_usage model=openai.gpt-5.6-sol total_input=3671 cached=3626 cache_write=0 fresh=45 output=12 hit=1
+```
+
+`emf` mode emits five **counters** under namespace `Custom/MantleProxy`, with
+`Model` and `Project` dimensions (`Project` is taken from the forwarded
+`OpenAI-Project` or `anthropic-workspace` header, else `default`):
+
+```text
+CacheReadTokens  CacheWriteTokens  FreshInputTokens  CacheHitRequests  Requests
+```
+
+Counters, not a ratio: averaging per-request ratios in CloudWatch weights a long
+cached prompt the same as a short uncached one. Divide the Sums instead.
+
+```json
+{
+  "metrics": [
+    [ "Custom/MantleProxy", "CacheReadTokens",  "Project", "default", { "id": "r", "visible": false, "stat": "Sum" } ],
+    [ ".", "CacheWriteTokens", ".", ".", { "id": "w", "visible": false, "stat": "Sum" } ],
+    [ ".", "FreshInputTokens", ".", ".", { "id": "f", "visible": false, "stat": "Sum" } ],
+    [ ".", "CacheHitRequests", ".", ".", { "id": "h", "visible": false, "stat": "Sum" } ],
+    [ ".", "Requests",         ".", ".", { "id": "q", "visible": false, "stat": "Sum" } ],
+    [ { "expression": "100*r/(r+w+f)", "label": "Cached token %" } ],
+    [ { "expression": "100*h/q",       "label": "Request hit rate" } ],
+    [ { "expression": "100*w/(r+w+f)", "label": "Cache write % (fragmentation)" } ]
+  ],
+  "stat": "Sum", "period": 300, "view": "timeSeries"
+}
+```
+
+Read all three together. A high cached percentage with cache write near zero means
+caching is working. A persistently high cache write percentage means the cache is
+being rebuilt repeatedly — usually an unstable prompt prefix (timestamps,
+whitespace drift, reordered JSON keys).
+
+### Token accounting
+
+Two incompatible conventions exist upstream, and mixing them up produces a rate
+that is wrong by roughly 2x. The proxy discriminates on which fields the upstream
+actually sent:
+
+| Convention | Upstream | Denominator |
+| --- | --- | --- |
+| inclusive | Responses API, OpenAI Chat Completions (`input_tokens_details` / `prompt_tokens_details`) | `input_tokens` already includes cached and cache-write tokens |
+| exclusive | Anthropic Messages (`cache_read_input_tokens` / `cache_creation_input_tokens`) | `input_tokens` excludes them, so add both |
+
+Non-streaming `/chat/completions` responses for OpenAI models additionally carry
+the cache detail through to the client as `usage.prompt_tokens_details`, so
+downstream consumers such as LiteLLM can read it.
+
+Known limitation: on Anthropic streaming, `message_start` carries the input and
+cache counts while `message_delta` carries only `output_tokens`. The sniffer keeps
+the former, so `output_tokens` is under-reported for that path. Cache accounting
+is unaffected because it is input-side.
 
 ## Client Authentication
 
@@ -171,21 +264,19 @@ The proxy does not require `acp-bridge`. The core service runs with only the con
 An optional LiteLLM callback for ACP Bridge lives at:
 
 ```text
-mantle_proxy/integrations/acp_bridge/litellm_callback.py
+litellm_callback.py
 ```
 
-It provides a LiteLLM `CustomLogger` instance named `proxy_handler_instance`. When configured in LiteLLM, it posts usage counters to:
+It provides a LiteLLM `CustomLogger` instance named `proxy_handler_instance`, and
+is loaded by LiteLLM (not by this proxy). When configured, it posts usage counters to:
 
 ```text
 http://127.0.0.1:18010/internal/llm-callback
 ```
 
-Override with:
-
-```bash
-export ACP_BRIDGE_CALLBACK_URL=http://127.0.0.1:18010/internal/llm-callback
-export ACP_BRIDGE_CALLBACK_API_KEY=
-```
+⚠️ This URL is currently a hardcoded constant (`CALLBACK_URL` in
+`litellm_callback.py`). There is no environment variable override and no callback
+authentication. Edit the constant to change it.
 
 The callback sends only:
 
@@ -199,9 +290,40 @@ The callback sends only:
 
 It does not send prompt text, completion text, request headers, API keys, or AWS credentials. Leave this integration unconfigured if you do not use ACP Bridge.
 
+The callback also rewrites `thinking.type` from `enabled` to `adaptive` for
+Claude Fable 5 models, which reject `enabled`.
+
 ## Compatibility Notes
 
-Streaming is not implemented. Requests with `stream: true` return HTTP `501` instead of silently downgrading to non-streaming behavior.
+### Streaming
+
+Streaming is implemented as an SSE pass-through on all routes. The proxy reorders
+`event:` before `data:` within each SSE block (OpenAI field order) and sniffs usage
+read-only; it does not otherwise alter the byte stream.
+
+⚠️ **Protocol caveat.** For `openai.*` models the two paths speak different
+protocols:
+
+| Request | Upstream path | Response protocol |
+| --- | --- | --- |
+| `/v1/chat/completions`, no `stream` | `/responses` | converted back to `chat.completion` |
+| `/v1/chat/completions`, `stream: true` | `/responses` | **raw Responses SSE** (`response.output_text.delta`, ...) — *not* `chat.completion.chunk` |
+
+A client that posts to `/v1/chat/completions` with `stream: true` and expects
+`chat.completion.chunk` events will not parse the result. This suits clients that
+already speak the Responses protocol (for example Codex); it does not suit a
+stock OpenAI SDK or LiteLLM. Non-`openai.*` models stream Chat Completions SSE
+unchanged and are unaffected.
+
+### Region override
+
+`X-Mantle-Region` is validated against canonical AWS region codes
+(`^[a-z]{2}(?:-[a-z]+)+-\d+$`). A malformed value is rejected with HTTP `400` and
+`type: invalid_region_override`. The header is interpolated into the upstream
+hostname, so an unvalidated value would let a client redirect signed requests and
+the prompt body to a host it controls.
+
+### Tools
 
 Function tools are converted from Chat Completions shape:
 
