@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,7 +26,20 @@ LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 FORWARD_HEADERS = {"openai-project", "openai-organization", "anthropic-workspace", "anthropic-version"}
 REGION_OVERRIDE_HEADER = "x-mantle-region"
 
+# The region is interpolated into the upstream hostname, so an unvalidated value
+# lets a client redirect signed requests (and the prompt body) to a host it
+# controls. Accept only canonical AWS region codes: us-east-1, ap-southeast-2,
+# us-gov-west-1, cn-north-1, ...
+REGION_PATTERN = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+$")
+
 log = logging.getLogger("mantle_proxy")
+
+
+def is_valid_region(region: str) -> bool:
+    """Return True if `region` is a canonical AWS region code."""
+    if not isinstance(region, str):
+        return False
+    return bool(REGION_PATTERN.match(region))
 
 
 @dataclass(frozen=True)
@@ -41,6 +55,7 @@ class Config:
     request_timeout_s: float
     max_body_bytes: int
     log_level: str
+    cache_metrics_mode: str = "log"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -60,6 +75,12 @@ class Config:
                 "set MANTLE_ALLOW_INSECURE_REMOTE=true."
             )
 
+        cache_metrics_mode = os.getenv("MANTLE_CACHE_METRICS", "log").strip().lower()
+        if cache_metrics_mode not in CACHE_METRICS_MODES:
+            raise ConfigError(
+                f"MANTLE_CACHE_METRICS must be one of {sorted(CACHE_METRICS_MODES)}"
+            )
+
         return cls(
             region=region,
             aws_service=os.getenv("MANTLE_AWS_SERVICE", "bedrock"),
@@ -72,6 +93,7 @@ class Config:
             request_timeout_s=_env_float("MANTLE_REQUEST_TIMEOUT_SECONDS", 120.0),
             max_body_bytes=_env_int("MANTLE_MAX_BODY_BYTES", 20 * 1024 * 1024),
             log_level=os.getenv("MANTLE_LOG_LEVEL", "INFO").upper(),
+            cache_metrics_mode=cache_metrics_mode,
         )
 
 
@@ -194,6 +216,11 @@ class SigV4Client:
 
     def _target_url(self, path: str, query: str = "", region_override: str | None = None) -> str:
         region = region_override or self.config.region
+        # Defense in depth: callers validate the override header, but this is the
+        # single place the region becomes a hostname, so never build a URL from
+        # an unvalidated value.
+        if not is_valid_region(region):
+            raise ValueError(f"refusing to build upstream URL for invalid region: {region!r}")
         normalized = normalize_path(path)
         # Anthropic Messages API uses a different base path
         if normalized.startswith("anthropic/"):
@@ -262,9 +289,25 @@ def json_error(status: int, code: str, message: str) -> web.Response:
 
 
 def _extract_forward_headers(request: web.Request) -> tuple[dict[str, str] | None, str | None]:
-    """Extract client headers to forward and optional region override."""
+    """Extract client headers to forward and optional region override.
+
+    Rejects a malformed region override with 400 rather than letting it reach
+    URL construction, where it would become an attacker-controlled hostname.
+    """
     fwd = {k: v for k, v in request.headers.items() if k.lower() in FORWARD_HEADERS}
     region = request.headers.get(REGION_OVERRIDE_HEADER)
+    if region is not None and not is_valid_region(region):
+        log.warning("rejected_invalid_region_override")
+        raise web.HTTPBadRequest(
+            text=json.dumps({
+                "error": {
+                    "message": f"Invalid {REGION_OVERRIDE_HEADER} header",
+                    "type": "invalid_region_override",
+                    "code": "invalid_region_override",
+                }
+            }),
+            content_type="application/json",
+        )
     return fwd or None, region
 
 
@@ -293,13 +336,16 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             payload["stream"] = True
             body = encode_json(payload)
             return await _handle_stream(request, client, "responses", body,
-                                        extra_headers=fwd, region_override=region)
+                                        extra_headers=fwd, region_override=region,
+                                        model=model)
         body = encode_json(payload)
         status, raw, content_type = await client.request("POST", "responses", body,
                                                          extra_headers=fwd, region_override=region)
         if status < 200 or status >= 300:
             return web.Response(body=raw, status=status, content_type=_content_type(content_type))
         upstream = json.loads(raw)
+        emit_cache_metrics(model, normalize_cache_usage(upstream.get("usage")),
+                           config.cache_metrics_mode, _project_from_headers(fwd))
         return web.json_response(responses_to_chat(upstream, config.default_model))
 
     # All other models: pass through to Chat Completions endpoint
@@ -307,22 +353,52 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     body = encode_json(data)
     if data.get("stream"):
         return await _handle_stream(request, client, "chat/completions", body,
-                                    extra_headers=fwd, region_override=region)
+                                    extra_headers=fwd, region_override=region,
+                                    model=model)
     status, raw, content_type = await client.request("POST", "chat/completions", body,
                                                      extra_headers=fwd, region_override=region)
+    _emit_cache_metrics_from_raw(config, model, raw, status, fwd)
     return web.Response(body=raw, status=status, content_type=_content_type(content_type))
 
 
+def _emit_cache_metrics_from_raw(config: Config, model: str, raw: bytes, status: int,
+                                 extra_headers: dict[str, str] | None) -> None:
+    """Emit cache counters from an unparsed upstream body. Never raises.
+
+    Used on passthrough paths where the body is forwarded verbatim; the parse
+    happens only for observability and only when metrics are enabled.
+    """
+    if config.cache_metrics_mode == "off" or status < 200 or status >= 300 or not raw:
+        return
+    try:
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return
+        usage = obj.get("usage")
+        if not isinstance(usage, dict):
+            response = obj.get("response")
+            usage = response.get("usage") if isinstance(response, dict) else None
+        emit_cache_metrics(model or obj.get("model") or "",
+                           normalize_cache_usage(usage),
+                           config.cache_metrics_mode,
+                           _project_from_headers(extra_headers))
+    except Exception:
+        log.debug("cache_metrics_raw_parse_failed", exc_info=True)
+
+
 async def handle_passthrough(request: web.Request) -> web.Response:
+    config: Config = request.app["config"]
     client: SigV4Client = request.app["sigv4"]
     body = await request.read()
     outbound_body: bytes | None = body or None
     is_stream = False
+    model = ""
 
     if body:
         data = maybe_parse_json_body(body, request.content_type)
         if isinstance(data, dict):
             is_stream = bool(data.get("stream"))
+            model = data.get("model") or ""
             data = filter_tools(data)
             outbound_body = encode_json(data)
 
@@ -331,7 +407,8 @@ async def handle_passthrough(request: web.Request) -> web.Response:
 
     if is_stream:
         return await _handle_stream(request, client, path, outbound_body,
-                                    extra_headers=fwd, region_override=region)
+                                    extra_headers=fwd, region_override=region,
+                                    model=model)
 
     status, raw, content_type = await client.request(
         request.method,
@@ -341,13 +418,15 @@ async def handle_passthrough(request: web.Request) -> web.Response:
         extra_headers=fwd,
         region_override=region,
     )
+    _emit_cache_metrics_from_raw(config, model, raw, status, fwd)
     return web.Response(body=raw, status=status, content_type=_content_type(content_type))
 
 
 async def _handle_stream(request: web.Request, client: SigV4Client,
                          path: str, body: bytes | None,
                          extra_headers: dict[str, str] | None = None,
-                         region_override: str | None = None) -> web.StreamResponse:
+                         region_override: str | None = None,
+                         model: str | None = None) -> web.StreamResponse:
     stream_gen = client.request_stream(request.method, path, body, request.query_string,
                                        extra_headers=extra_headers,
                                        region_override=region_override)
@@ -358,18 +437,50 @@ async def _handle_stream(request: web.Request, client: SigV4Client,
     resp.enable_chunked_encoding()
     await resp.prepare(request)
 
+    config: Config = request.app["config"]
+    usage_seen: dict[str, Any] | None = None
+
     buf = b""
     async for chunk in stream_gen:
         buf += chunk
         # Process complete SSE blocks (separated by \n\n)
         while b"\n\n" in buf:
             block, buf = buf.split(b"\n\n", 1)
+            usage_seen = _sniff_usage(block, usage_seen)
             await resp.write(_reorder_sse_block(block) + b"\n\n")
     if buf:
+        usage_seen = _sniff_usage(buf, usage_seen)
         await resp.write(_reorder_sse_block(buf) + b"\n\n")
 
     await resp.write_eof()
+
+    # After the client has been served: forwarded bytes are untouched by this.
+    emit_cache_metrics(
+        model or "",
+        normalize_cache_usage(usage_seen),
+        config.cache_metrics_mode,
+        _project_from_headers(extra_headers),
+    )
     return resp
+
+
+def _sniff_usage(block: bytes, current: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Read-only usage sniff. Keeps the last usage seen; never raises."""
+    try:
+        usage = extract_usage_from_sse_block(block)
+    except Exception:
+        log.debug("sse_usage_sniff_failed", exc_info=True)
+        return current
+    return usage or current
+
+
+def _project_from_headers(extra_headers: dict[str, str] | None) -> str:
+    if not extra_headers:
+        return "default"
+    for key, value in extra_headers.items():
+        if key.lower() in {"openai-project", "anthropic-workspace"} and value:
+            return value
+    return "default"
 
 
 def _reorder_sse_block(block: bytes) -> bytes:
@@ -386,6 +497,174 @@ def _reorder_sse_block(block: bytes) -> bytes:
         else:
             other_lines.append(line)
     return b"\n".join(event_lines + data_lines + other_lines)
+
+
+# --------------------------------------------------------------------------
+# Prompt cache observability
+#
+# Mantle publishes no cache metric to CloudWatch (namespace AWS/BedrockMantle
+# has Inferences/TotalInputTokens/... but nothing cache-specific, unlike
+# AWS/Bedrock's CacheReadInputTokenCount). The response usage object is the
+# only authoritative source, so we sniff it read-only and emit counters.
+#
+# These helpers never modify the forwarded payload.
+# --------------------------------------------------------------------------
+
+CACHE_METRICS_MODES = {"off", "log", "emf"}
+CACHE_METRICS_NAMESPACE = "Custom/MantleProxy"
+
+
+def extract_usage_from_sse_block(block: bytes) -> dict[str, Any] | None:
+    """Pull a usage object out of one SSE block, or None.
+
+    Tolerant by design: a parse failure must never disturb the stream. Looks in
+    the three places upstreams put usage:
+      - Responses API           -> data.response.usage  (response.completed)
+      - Chat Completions stream -> data.usage           (final chunk)
+      - Anthropic Messages      -> data.message.usage   (message_start)
+
+    Ignores output-only usage (Anthropic message_delta) because cache
+    accounting needs the input-token side.
+    """
+    payload_lines = []
+    for line in block.split(b"\n"):
+        if line.startswith(b"data:"):
+            payload_lines.append(line[5:].strip())
+    if not payload_lines:
+        return None
+
+    raw = b"".join(payload_lines)
+    if not raw or raw == b"[DONE]":
+        return None
+
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    for container in (obj, obj.get("response"), obj.get("message")):
+        if not isinstance(container, dict):
+            continue
+        usage = container.get("usage")
+        if isinstance(usage, dict) and (
+            usage.get("input_tokens") is not None or usage.get("prompt_tokens") is not None
+        ):
+            return usage
+    return None
+
+
+def normalize_cache_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize a usage object into cache accounting with a correct denominator.
+
+    Two incompatible upstream conventions exist, and mixing them up is the
+    easiest way to get a cache rate that is wrong by ~2x:
+
+      inclusive  Responses API / OpenAI Chat Completions
+                 input_tokens ALREADY includes cached + cache-write tokens
+                 -> total_input_tokens = input_tokens
+
+      exclusive  Anthropic Messages
+                 input_tokens EXCLUDES them
+                 -> total_input_tokens = input_tokens + read + creation
+
+    Discriminated by which fields the upstream actually sent. Returns None when
+    there is nothing to report.
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    base_input = usage.get("input_tokens")
+    if base_input is None:
+        base_input = usage.get("prompt_tokens")
+    if base_input is None:
+        return None
+    base_input = int(base_input)
+
+    output_tokens = usage.get("output_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("completion_tokens") or 0
+    output_tokens = int(output_tokens)
+
+    anthropic_read = usage.get("cache_read_input_tokens")
+    anthropic_write = usage.get("cache_creation_input_tokens")
+
+    if anthropic_read is not None or anthropic_write is not None:
+        cached = int(anthropic_read or 0)
+        cache_write = int(anthropic_write or 0)
+        total_input = base_input + cached + cache_write
+    else:
+        details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        cached = int(details.get("cached_tokens") or 0)
+        cache_write = int(details.get("cache_write_tokens") or 0)
+        total_input = base_input
+
+    fresh = total_input - cached - cache_write
+    if fresh < 0:
+        # Semantics did not match expectations; report without a bogus split
+        # rather than emitting a negative counter.
+        log.warning("cache_usage_semantics_mismatch total_input=%s cached=%s write=%s",
+                    total_input, cached, cache_write)
+        fresh = 0
+
+    return {
+        "total_input_tokens": total_input,
+        "output_tokens": output_tokens,
+        "cached_tokens": cached,
+        "cache_write_tokens": cache_write,
+        "fresh_input_tokens": fresh,
+        "cache_hit": 1 if cached > 0 else 0,
+    }
+
+
+def emit_cache_metrics(model: str, norm: dict[str, Any] | None, mode: str,
+                       project: str = "default") -> None:
+    """Emit cache counters. Never raises.
+
+    Emits counters, not a per-request ratio: averaging per-request ratios in
+    CloudWatch gives the wrong answer because a long cached prompt and a short
+    uncached one would be weighted equally. Divide the Sums instead.
+    """
+    if mode == "off" or not norm:
+        return
+    try:
+        if mode == "emf":
+            print(json.dumps({
+                "_aws": {
+                    "Timestamp": int(time.time() * 1000),
+                    "CloudWatchMetrics": [{
+                        "Namespace": CACHE_METRICS_NAMESPACE,
+                        "Dimensions": [["Model", "Project"], ["Project"]],
+                        "Metrics": [
+                            {"Name": "CacheReadTokens", "Unit": "Count"},
+                            {"Name": "CacheWriteTokens", "Unit": "Count"},
+                            {"Name": "FreshInputTokens", "Unit": "Count"},
+                            {"Name": "CacheHitRequests", "Unit": "Count"},
+                            {"Name": "Requests", "Unit": "Count"},
+                        ],
+                    }],
+                },
+                "Model": model or "unknown",
+                "Project": project,
+                "CacheReadTokens": norm["cached_tokens"],
+                "CacheWriteTokens": norm["cache_write_tokens"],
+                "FreshInputTokens": norm["fresh_input_tokens"],
+                "CacheHitRequests": norm["cache_hit"],
+                "Requests": 1,
+            }, separators=(",", ":")), flush=True)
+        else:
+            log.info(
+                "cache_usage model=%s total_input=%s cached=%s cache_write=%s "
+                "fresh=%s output=%s hit=%s",
+                model or "unknown", norm["total_input_tokens"], norm["cached_tokens"],
+                norm["cache_write_tokens"], norm["fresh_input_tokens"],
+                norm["output_tokens"], norm["cache_hit"],
+            )
+    except Exception:  # observability must never break a request
+        log.debug("cache_metrics_emit_failed", exc_info=True)
 
 
 def maybe_parse_json_body(body: bytes, content_type: str) -> Any:
@@ -660,12 +939,54 @@ def responses_to_chat(data: dict[str, Any], default_model: str) -> dict[str, Any
         "created": int(time.time()),
         "model": data.get("model") or default_model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        },
+        "usage": build_usage(usage, prompt_tokens, completion_tokens, total_tokens),
     }
+
+
+def build_usage(upstream_usage: dict[str, Any], prompt_tokens: int,
+                completion_tokens: int, total_tokens: int) -> dict[str, Any]:
+    """Build a Chat Completions usage object, preserving prompt cache detail.
+
+    Mantle's Responses API reports cache activity under
+    `usage.input_tokens_details`; the OpenAI Chat Completions shape uses
+    `usage.prompt_tokens_details`. Dropping these fields makes prompt cache
+    hit rate unobservable for every client behind this proxy, since Mantle
+    publishes no cache metric to CloudWatch (namespace AWS/BedrockMantle has
+    no cache metric, unlike AWS/Bedrock's CacheReadInputTokenCount).
+
+    Note on semantics: for the Responses API `input_tokens` already includes
+    both cached and cache-write tokens, so `prompt_tokens` needs no
+    adjustment and the cached ratio is `cached_tokens / prompt_tokens`.
+    """
+    out: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+    details = (
+        upstream_usage.get("input_tokens_details")
+        or upstream_usage.get("prompt_tokens_details")
+        or {}
+    )
+    if not isinstance(details, dict):
+        return out
+
+    cached_tokens = details.get("cached_tokens") or 0
+    cache_write_tokens = details.get("cache_write_tokens") or 0
+
+    # Anthropic-style top-level fields, in case an upstream reports them here.
+    if not cached_tokens:
+        cached_tokens = upstream_usage.get("cache_read_input_tokens") or 0
+    if not cache_write_tokens:
+        cache_write_tokens = upstream_usage.get("cache_creation_input_tokens") or 0
+
+    if cached_tokens or cache_write_tokens:
+        out["prompt_tokens_details"] = {
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
+        }
+    return out
 
 
 def extract_reasoning(item: dict[str, Any]) -> str:
