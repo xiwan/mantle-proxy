@@ -65,7 +65,7 @@ These are consumed by LiteLLM, not by the proxy:
 | Variable | Notes |
 |----------|-------|
 | `LITELLM_API_KEY` | LiteLLM master key. |
-| `MANTLE_PROJECT_ID` | Injected as the `OpenAI-Project` / `anthropic-workspace` header on Mantle-backed models for Project and Workspace cost tracking. |
+| `MANTLE_PROJECT_ID` | Injected as the `OpenAI-Project` / `anthropic-workspace` header on Mantle-backed models for Project and Workspace cost tracking. **Must be a full project ARN**, not a bare name — Mantle rejects anything else with `validation_error: '<value>' is not a valid project ARN`. Format: `arn:aws:bedrock-mantle:<region>:<account-id>:project/<project-name>` (the default project is named `default`). |
 
 ### Adding a model
 
@@ -314,6 +314,28 @@ A client that posts to `/v1/chat/completions` with `stream: true` and expects
 already speak the Responses protocol (for example Codex); it does not suit a
 stock OpenAI SDK or LiteLLM. Non-`openai.*` models stream Chat Completions SSE
 unchanged and are unaffected.
+
+### Verified upstream behaviour
+
+Observed against `bedrock-mantle.us-east-1.api.aws` with `openai.gpt-5.6-sol`
+(2026-08-03):
+
+- Mantle's Responses API reports cache activity under
+  **`usage.input_tokens_details`** (`cached_tokens`, `cache_write_tokens`), not the
+  OpenAI Chat Completions `usage.prompt_tokens_details`. `input_tokens` **includes**
+  cached and cache-write tokens.
+- Early events (`response.created`, `response.in_progress`) carry `usage: null`.
+  A stream truncated by `max_output_tokens` terminates with
+  `response.incomplete` and **never emits `response.completed`** — the usage
+  sniffer therefore keys on where usage appears, not on the event name.
+- `GET /v1/models` returns HTTP `404`; Mantle does not expose a model list here.
+- `max_output_tokens` has a minimum of `16` for `openai.gpt-5.6-sol`; lower values
+  are rejected with `integer_below_min_value`.
+- SigV4 with service name `bedrock` (the `MANTLE_AWS_SERVICE` default) is accepted.
+- Anthropic models may be unavailable from some locations, returning
+  `invalid_request_error: Access to Anthropic models is not allowed from
+  unsupported countries, regions, or territories`. This is independent of the AWS
+  region and of this proxy.
 
 ### Region override
 
