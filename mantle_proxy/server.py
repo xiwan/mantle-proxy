@@ -727,6 +727,12 @@ def chat_to_responses(data: dict[str, Any], default_model: str) -> dict[str, Any
         "store": "store",
         "parallel_tool_calls": "parallel_tool_calls",
         "user": "user",
+        # Explicit prompt cache control. Verified upstream: prompt_cache_key
+        # partitions the cache (a different key on an identical prefix is a
+        # miss), so dropping it silently collapses every caller into one shared
+        # implicit partition and removes all explicit cache control.
+        "prompt_cache_key": "prompt_cache_key",
+        "prompt_cache_retention": "prompt_cache_retention",
     }
     for source, target in field_map.items():
         if source in data and data[source] is not None:

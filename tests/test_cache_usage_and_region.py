@@ -7,6 +7,7 @@ from mantle_proxy.server import (
     REGION_OVERRIDE_HEADER,
     Config,
     SigV4Client,
+    chat_to_responses,
     _extract_forward_headers,
     build_usage,
     is_valid_region,
@@ -278,3 +279,34 @@ def test_chat_completions_used_for_gpt_oss(model):
 ])
 def test_responses_api_not_used_for_non_openai_models(model):
     assert uses_responses_api(model) is False
+
+
+# --------------------------------------------------------------------------
+# Explicit prompt cache control
+# --------------------------------------------------------------------------
+
+
+def test_chat_to_responses_forwards_prompt_cache_key():
+    """Verified upstream: a different prompt_cache_key on an identical prefix is
+    a cache miss, so dropping the key collapses all callers into one shared
+    implicit partition and removes explicit cache control entirely.
+    """
+    converted = chat_to_responses({
+        "model": "openai.gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "tenant-42",
+        "prompt_cache_retention": "in_memory",
+    }, "fallback")
+
+    assert converted["prompt_cache_key"] == "tenant-42"
+    assert converted["prompt_cache_retention"] == "in_memory"
+
+
+def test_chat_to_responses_omits_cache_control_when_absent():
+    converted = chat_to_responses({
+        "model": "openai.gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hi"}],
+    }, "fallback")
+
+    assert "prompt_cache_key" not in converted
+    assert "prompt_cache_retention" not in converted

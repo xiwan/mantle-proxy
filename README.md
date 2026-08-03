@@ -339,6 +339,11 @@ Observed against `bedrock-mantle.us-east-1.api.aws` with `openai.gpt-5.6-sol`
 - `GET /v1/models` returns HTTP `404`; Mantle does not expose a model list here.
 - `max_output_tokens` has a minimum of `16` for `openai.gpt-5.6-sol`; lower values
   are rejected with `integer_below_min_value`.
+- `prompt_cache_key` partitions the cache: an identical prefix sent under a
+  different key is a miss, and repeats under the same key hit. It is forwarded
+  from Chat Completions to the Responses API, along with
+  `prompt_cache_retention`. Dropping it (as earlier versions did) silently
+  collapses every caller into one shared implicit partition.
 - Model route support is **not** derivable from the `openai.` prefix alone.
   `openai.gpt-oss-*` rejects `/openai/v1/responses` with `The model '<id>' does
   not support the '/openai/v1/responses' API`, so it is routed to
