@@ -11,6 +11,7 @@ from mantle_proxy.server import (
     build_usage,
     is_valid_region,
     responses_to_chat,
+    uses_responses_api,
 )
 
 
@@ -246,3 +247,34 @@ def test_target_url_builds_expected_hosts():
     assert client._target_url("anthropic/v1/messages") == (
         "https://bedrock-mantle.us-east-2.api.aws/anthropic/v1/messages"
     )
+
+
+# --------------------------------------------------------------------------
+# Route selection
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model", [
+    "openai.gpt-5.5", "openai.gpt-5.6-sol", "openai.gpt-5.6-terra", "openai.gpt-5.6-luna",
+])
+def test_responses_api_used_for_responses_capable_openai_models(model):
+    assert uses_responses_api(model) is True
+
+
+@pytest.mark.parametrize("model", ["openai.gpt-oss-120b", "openai.gpt-oss-20b"])
+def test_chat_completions_used_for_gpt_oss(model):
+    """Observed upstream: gpt-oss rejects /openai/v1/responses with validation_error.
+
+    Routing on the bare "openai." prefix sent these to /responses and made them
+    unreachable, since no other path can target chat/completions for an
+    openai.* model.
+    """
+    assert uses_responses_api(model) is False
+
+
+@pytest.mark.parametrize("model", [
+    "anthropic.claude-haiku-4-5", "moonshotai.kimi-k2.5", "qwen.qwen3-coder-next",
+    "", "gpt-5.5", "not-openai.gpt-5.5", None, 123,
+])
+def test_responses_api_not_used_for_non_openai_models(model):
+    assert uses_responses_api(model) is False

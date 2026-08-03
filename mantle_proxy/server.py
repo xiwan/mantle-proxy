@@ -42,6 +42,21 @@ def is_valid_region(region: str) -> bool:
     return bool(REGION_PATTERN.match(region))
 
 
+# Most openai.* models on Mantle are Responses-only, but not all: the gpt-oss
+# family is served on Chat Completions and rejects /openai/v1/responses with
+# "The model '<id>' does not support the '/openai/v1/responses' API". Routing
+# purely on the "openai." prefix makes those models unreachable through this
+# proxy, since nothing else can send an openai.* model to chat/completions.
+CHAT_COMPLETIONS_ONLY_PREFIXES = ("openai.gpt-oss",)
+
+
+def uses_responses_api(model: str) -> bool:
+    """Whether `model` should be routed to /responses rather than /chat/completions."""
+    if not isinstance(model, str) or not model.startswith("openai."):
+        return False
+    return not model.startswith(CHAT_COMPLETIONS_ONLY_PREFIXES)
+
+
 @dataclass(frozen=True)
 class Config:
     region: str
@@ -329,8 +344,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     fwd, region = _extract_forward_headers(request)
     model = data.get("model") or config.default_model
 
-    # OpenAI models only support Responses API; others support Chat Completions natively
-    if model.startswith("openai."):
+    # Most OpenAI models are Responses-only; gpt-oss is Chat Completions only.
+    # See uses_responses_api().
+    if uses_responses_api(model):
         payload = chat_to_responses(data, config.default_model)
         if data.get("stream"):
             payload["stream"] = True
