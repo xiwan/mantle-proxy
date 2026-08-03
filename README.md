@@ -275,9 +275,16 @@ is loaded by LiteLLM (not by this proxy). When configured, it posts usage counte
 http://127.0.0.1:18010/internal/llm-callback
 ```
 
-⚠️ This URL is currently a hardcoded constant (`CALLBACK_URL` in
-`litellm_callback.py`). There is no environment variable override and no callback
-authentication. Edit the constant to change it.
+Override with:
+
+```bash
+export ACP_BRIDGE_CALLBACK_URL=http://127.0.0.1:18010/internal/llm-callback
+export ACP_BRIDGE_CALLBACK_TIMEOUT_SECONDS=5      # invalid or non-positive falls back to 5
+export ACP_BRIDGE_CALLBACK_API_KEY=               # optional; sent as Authorization: Bearer
+```
+
+Delivery failures are logged as warnings on the `mantle_proxy.acp_bridge` logger
+(both transport errors and non-2xx responses) rather than silently discarded.
 
 The callback sends only:
 
@@ -332,6 +339,18 @@ Observed against `bedrock-mantle.us-east-1.api.aws` with `openai.gpt-5.6-sol`
 - `GET /v1/models` returns HTTP `404`; Mantle does not expose a model list here.
 - `max_output_tokens` has a minimum of `16` for `openai.gpt-5.6-sol`; lower values
   are rejected with `integer_below_min_value`.
+- Model route support is **not** derivable from the `openai.` prefix alone.
+  `openai.gpt-oss-*` rejects `/openai/v1/responses` with `The model '<id>' does
+  not support the '/openai/v1/responses' API`, so it is routed to
+  `chat/completions` (see `uses_responses_api()`). On the account tested it was
+  rejected there too (`isn't supported on this route`), so gpt-oss appears
+  unavailable rather than merely mis-routed — the route correction is unverified
+  end to end.
+- Converse-only models are not reachable through this proxy at all.
+  `moonshotai.kimi-k2.5` and `qwen.qwen3-coder-next` exist in Mantle's registry
+  but return `isn't supported on this route` on both `chat/completions` and
+  `responses`; `litellm-config.yaml` correctly routes them via `bedrock/`
+  (Converse) instead. `amazon.nova-*` and `deepseek.*` return `does not exist`.
 - SigV4 with service name `bedrock` (the `MANTLE_AWS_SERVICE` default) is accepted.
 - Anthropic Messages (`anthropic.claude-haiku-4-5`) reports cache activity as
   top-level `cache_read_input_tokens` / `cache_creation_input_tokens`, and
