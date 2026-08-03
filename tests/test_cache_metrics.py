@@ -379,3 +379,88 @@ def test_cache_metrics_mode_rejects_invalid_value(monkeypatch):
     monkeypatch.setenv("MANTLE_CACHE_METRICS", "prometheus")
     with pytest.raises(ConfigError):
         Config.from_env()
+
+
+# --------------------------------------------------------------------------
+# Regression guards captured from real Bedrock Mantle traffic
+# (openai.gpt-5.6-sol via bedrock-mantle.us-east-1.api.aws, 2026-08-03)
+#
+# The sniffer keys on WHERE usage appears (data.response.usage), not on the
+# event name. That is load-bearing: a stream truncated by max_output_tokens
+# terminates with response.incomplete and never emits response.completed.
+# Rewriting this as `if event == "response.completed"` would silently stop
+# collecting cache data for every truncated response.
+# --------------------------------------------------------------------------
+
+# Verbatim usage payload observed on a normally-finished stream.
+REAL_COMPLETED_BLOCK = (
+    b'event: response.completed\n'
+    b'data: {"type":"response.completed","response":{"id":"resp_x",'
+    b'"model":"openai.gpt-5.6-sol","status":"completed","usage":{"input_tokens":3315,'
+    b'"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":3313},'
+    b'"output_tokens":58,"output_tokens_details":{"reasoning_tokens":51},'
+    b'"total_tokens":3373}}}'
+)
+
+# Verbatim usage payload observed when max_output_tokens truncated the response.
+REAL_INCOMPLETE_BLOCK = (
+    b'event: response.incomplete\n'
+    b'data: {"type":"response.incomplete","response":{"id":"resp_y",'
+    b'"model":"openai.gpt-5.6-sol","status":"incomplete",'
+    b'"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5741,'
+    b'"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":5739},'
+    b'"output_tokens":16,"output_tokens_details":{"reasoning_tokens":16},'
+    b'"total_tokens":5757}}}'
+)
+
+# Observed on response.created / response.in_progress: the key exists but is null.
+REAL_NULL_USAGE_BLOCK = (
+    b'event: response.created\n'
+    b'data: {"type":"response.created","response":{"id":"resp_z",'
+    b'"model":"openai.gpt-5.6-sol","status":"in_progress","usage":null,'
+    b'"prompt_cache_key":null,"prompt_cache_retention":"in_memory"}}'
+)
+
+
+@pytest.mark.parametrize("block,expected_cached,expected_total", [
+    (REAL_COMPLETED_BLOCK, 3313, 3315),
+    (REAL_INCOMPLETE_BLOCK, 5739, 5741),
+])
+def test_sniffer_reads_usage_regardless_of_terminal_event(block, expected_cached, expected_total):
+    usage = extract_usage_from_sse_block(block)
+    assert usage is not None, "usage must be found even when the event is not response.completed"
+
+    norm = normalize_cache_usage(usage)
+    assert norm["cached_tokens"] == expected_cached
+    assert norm["total_input_tokens"] == expected_total
+    assert norm["cache_hit"] == 1
+
+
+def test_sniffer_skips_null_usage_on_early_events():
+    """response.created carries `usage: null`; it must not be mistaken for data."""
+    assert extract_usage_from_sse_block(REAL_NULL_USAGE_BLOCK) is None
+
+
+def test_truncated_stream_still_yields_cache_usage():
+    """Full-stream regression: no response.completed anywhere, yet usage is collected."""
+    stream = [REAL_NULL_USAGE_BLOCK + b"\n\n", REAL_INCOMPLETE_BLOCK + b"\n\n"]
+    forwarded, usage = _run_loop_with_sniff(stream)
+
+    assert b"response.completed" not in forwarded
+    assert forwarded == _run_loop_without_sniff(stream)
+    assert usage is not None, (
+        "no usage collected from a stream that ends in response.incomplete; "
+        "the sniffer must key on where usage appears, not on the event name"
+    )
+    assert normalize_cache_usage(usage)["cached_tokens"] == 5739
+
+
+def test_output_tokens_details_does_not_disturb_normalisation():
+    """Real Mantle usage includes output_tokens_details.reasoning_tokens."""
+    norm = normalize_cache_usage(json.loads(
+        b'{"input_tokens":3315,"input_tokens_details":{"cached_tokens":3313,'
+        b'"cache_write_tokens":0},"output_tokens":58,'
+        b'"output_tokens_details":{"reasoning_tokens":51},"total_tokens":3373}'
+    ))
+    assert norm["output_tokens"] == 58
+    assert norm["fresh_input_tokens"] == 2
