@@ -302,6 +302,53 @@ def test_chat_to_responses_forwards_prompt_cache_key():
     assert converted["prompt_cache_retention"] == "in_memory"
 
 
+def test_chat_to_responses_forwards_explicit_cache_options():
+    converted = chat_to_responses({
+        "model": "openai.gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "support-app:kb-v1",
+        "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+    }, "fallback")
+
+    assert converted["prompt_cache_key"] == "support-app:kb-v1"
+    assert converted["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+
+
+@pytest.mark.parametrize(("content", "expected"), [
+    (
+        {
+            "type": "text",
+            "text": "stable instructions",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+        {
+            "type": "input_text",
+            "text": "stable instructions",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+    ),
+    (
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AA==",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+    ),
+])
+def test_chat_to_responses_preserves_explicit_breakpoint(content, expected):
+    converted = chat_to_responses({
+        "model": "openai.gpt-5.6-sol",
+        "messages": [{"role": "developer", "content": [content]}],
+    }, "fallback")
+
+    assert converted["input"][0]["content"] == [expected]
+
+
 def test_chat_to_responses_omits_cache_control_when_absent():
     converted = chat_to_responses({
         "model": "openai.gpt-5.6-sol",
@@ -309,4 +356,5 @@ def test_chat_to_responses_omits_cache_control_when_absent():
     }, "fallback")
 
     assert "prompt_cache_key" not in converted
+    assert "prompt_cache_options" not in converted
     assert "prompt_cache_retention" not in converted

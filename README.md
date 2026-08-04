@@ -15,6 +15,7 @@ https://bedrock-mantle.<region>.api.aws/openai/v1
 - `/anthropic/` path routes to Bedrock Mantle Anthropic Messages API (Claude + workspace cost tracking).
 - Streaming (`stream: true`) is supported on all routes as an SSE pass-through. See [Streaming](#streaming) for the protocol caveat.
 - Prompt cache observability: read-only usage sniffing on both streaming and non-streaming paths, optionally emitted as CloudWatch metrics. See [Prompt Cache Observability](#prompt-cache-observability).
+- GPT-5.6 explicit prompt caching through direct Responses requests and the Chat Completions compatibility path.
 - Per-request region override via `X-Mantle-Region` header, validated against canonical AWS region codes.
 - Forwards `OpenAI-Project`, `anthropic-workspace`, `anthropic-version` headers for Project/Workspace cost tracking.
 - Passthrough for other Mantle OpenAI-compatible paths, including `/v1/responses`.
@@ -147,6 +148,69 @@ curl http://127.0.0.1:4010/v1/responses \
   }'
 ```
 
+## GPT-5.6 Explicit Prompt Caching
+
+GPT-5.6 uses implicit prompt caching by default. For a stable prefix followed by
+changing user or tool-loop content, explicit mode makes the cache boundary
+deterministic. A cached prefix must contain at least 1,024 tokens; GPT-5.6 accepts
+up to four breakpoints per request and keeps cached prefixes for at least 30
+minutes.
+
+A direct Responses request uses the AWS request shape unchanged:
+
+```json
+{
+  "model": "openai.gpt-5.6-sol",
+  "prompt_cache_key": "support-app:kb-v1",
+  "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Long, stable instructions of at least 1,024 tokens...",
+          "prompt_cache_breakpoint": {"mode": "explicit"}
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "Changing question"}]
+    }
+  ]
+}
+```
+
+The Chat Completions compatibility route also forwards `prompt_cache_options`.
+Because breakpoints are not part of the standard Chat Completions schema, this
+route uses a proxy extension on `text` or `image_url` content blocks and converts
+it to the corresponding Responses block:
+
+```json
+{
+  "model": "openai.gpt-5.6-sol",
+  "prompt_cache_key": "support-app:kb-v1",
+  "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+  "messages": [{
+    "role": "developer",
+    "content": [{
+      "type": "text",
+      "text": "Long, stable instructions of at least 1,024 tokens...",
+      "prompt_cache_breakpoint": {"mode": "explicit"}
+    }]
+  }]
+}
+```
+
+Use a stable, namespaced cache key such as `<project>:<prompt-version>` and do
+not put prompt text or credentials in the key. Setting explicit mode without any
+breakpoints opts out of billed cache reads and writes. AWS currently bills cache
+writes at 1.25 times the uncached input rate and cache reads at 10 percent of the
+uncached rate; verify current rates on the Amazon Bedrock pricing page.
+
 ## Prompt Cache Observability
 
 Bedrock Mantle publishes **no cache metric to CloudWatch**. The `AWS/BedrockMantle`
@@ -194,16 +258,19 @@ cached prompt the same as a short uncached one. Divide the Sums instead.
     [ ".", "Requests",         ".", ".", { "id": "q", "visible": false, "stat": "Sum" } ],
     [ { "expression": "100*r/(r+w+f)", "label": "Cached token %" } ],
     [ { "expression": "100*h/q",       "label": "Request hit rate" } ],
-    [ { "expression": "100*w/(r+w+f)", "label": "Cache write % (fragmentation)" } ]
+    [ { "expression": "100*w/(r+w+f)", "label": "Cache write % (fragmentation)" } ],
+    [ { "expression": "100*(1-(f+1.25*w+0.1*r)/(r+w+f))", "label": "Estimated input cost saving %" } ]
   ],
   "stat": "Sum", "period": 300, "view": "timeSeries"
 }
 ```
 
-Read all three together. A high cached percentage with cache write near zero means
+Read all four together. A high cached percentage with cache write near zero means
 caching is working. A persistently high cache write percentage means the cache is
 being rebuilt repeatedly — usually an unstable prompt prefix (timestamps,
-whitespace drift, reordered JSON keys).
+whitespace drift, reordered JSON keys). The cost expression uses the GPT-5.6
+write/read multipliers documented by AWS; a negative value means cache writes
+cost more than the reads saved during that period.
 
 ### Token accounting
 
@@ -397,9 +464,11 @@ Observed against `bedrock-mantle.us-east-1.api.aws` with `openai.gpt-5.6-sol`
   are rejected with `integer_below_min_value`.
 - `prompt_cache_key` partitions the cache: an identical prefix sent under a
   different key is a miss, and repeats under the same key hit. It is forwarded
-  from Chat Completions to the Responses API, along with
-  `prompt_cache_retention`. Dropping it (as earlier versions did) silently
-  collapses every caller into one shared implicit partition.
+  from Chat Completions to the Responses API, along with `prompt_cache_options`
+  and the compatibility field `prompt_cache_retention`. GPT-5.6 explicit
+  `prompt_cache_breakpoint` values are preserved when text and image content
+  blocks are converted. Dropping the key silently collapses every caller into
+  one shared implicit partition.
 - Model route support is **not** derivable from the `openai.` prefix alone.
   `openai.gpt-oss-*` rejects `/openai/v1/responses` with `The model '<id>' does
   not support the '/openai/v1/responses' API`, so it is routed to

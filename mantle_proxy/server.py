@@ -732,6 +732,10 @@ def chat_to_responses(data: dict[str, Any], default_model: str) -> dict[str, Any
         # miss), so dropping it silently collapses every caller into one shared
         # implicit partition and removes all explicit cache control.
         "prompt_cache_key": "prompt_cache_key",
+        # GPT-5.6 uses this object to select implicit or explicit cache mode and
+        # its TTL. Content-level breakpoints are preserved by convert_content().
+        "prompt_cache_options": "prompt_cache_options",
+        # Kept for compatibility with clients that use OpenAI's retention field.
         "prompt_cache_retention": "prompt_cache_retention",
     }
     for source, target in field_map.items():
@@ -803,10 +807,16 @@ def convert_content(role: str, content: Any) -> Any:
             continue
         part_type = part.get("type")
         if part_type == "text":
-            converted.append({"type": "input_text", "text": part.get("text", "")})
+            converted_part = {"type": "input_text", "text": part.get("text", "")}
+            if "prompt_cache_breakpoint" in part:
+                converted_part["prompt_cache_breakpoint"] = part["prompt_cache_breakpoint"]
+            converted.append(converted_part)
         elif part_type == "image_url":
             image_url = part.get("image_url") or {}
-            converted.append({"type": "input_image", "image_url": image_url.get("url", "")})
+            converted_part = {"type": "input_image", "image_url": image_url.get("url", "")}
+            if "prompt_cache_breakpoint" in part:
+                converted_part["prompt_cache_breakpoint"] = part["prompt_cache_breakpoint"]
+            converted.append(converted_part)
         else:
             converted.append(part)
     return converted
