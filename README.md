@@ -220,6 +220,57 @@ Non-streaming `/chat/completions` responses for OpenAI models additionally carry
 the cache detail through to the client as `usage.prompt_tokens_details`, so
 downstream consumers such as LiteLLM can read it.
 
+#### Client-side cache rate
+
+The cache token counts originate in the Mantle response. The proxy does not
+calculate a cache rate or change the numeric values. A direct `/v1/responses`
+call receives Mantle's response shape unchanged; the Chat Completions
+compatibility path only renames the surrounding OpenAI fields:
+
+| Mantle Responses field | Chat Completions / LiteLLM field |
+| --- | --- |
+| `usage.input_tokens` | `usage.prompt_tokens` |
+| `usage.input_tokens_details.cached_tokens` | `usage.prompt_tokens_details.cached_tokens` |
+| `usage.input_tokens_details.cache_write_tokens` | `usage.prompt_tokens_details.cache_write_tokens` |
+
+For these inclusive OpenAI-style responses, a client can calculate:
+
+```text
+cache_read_rate  = cached_tokens / prompt_tokens
+cache_write_rate = cache_write_tokens / prompt_tokens
+fresh_input_rate = (prompt_tokens - cached_tokens - cache_write_tokens) / prompt_tokens
+```
+
+For example, the end-to-end LiteLLM response verified on 2026-08-04 changed
+from a cold request:
+
+```json
+{
+  "prompt_tokens": 4810,
+  "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "cache_write_tokens": 4808
+  }
+}
+```
+
+to a cache hit for the identical prompt and `prompt_cache_key`:
+
+```json
+{
+  "prompt_tokens": 4810,
+  "prompt_tokens_details": {
+    "cached_tokens": 4808,
+    "cache_write_tokens": 0
+  }
+}
+```
+
+The client-visible cache read rate is therefore `4808 / 4810 = 99.96%`.
+Treat a missing `prompt_tokens_details` as zero cache read and zero cache write:
+the compatibility response omits that object when both upstream counts are
+zero.
+
 On Anthropic streaming, `message_start` and `message_delta` both carry the full
 usage object — `input_tokens`, `cache_read_input_tokens` and
 `cache_creation_input_tokens` are repeated on `message_delta` alongside the final
@@ -332,6 +383,11 @@ Observed against `bedrock-mantle.us-east-1.api.aws` with `openai.gpt-5.6-sol`
   **`usage.input_tokens_details`** (`cached_tokens`, `cache_write_tokens`), not the
   OpenAI Chat Completions `usage.prompt_tokens_details`. `input_tokens` **includes**
   cached and cache-write tokens.
+- A live cold/warm check on 2026-08-04 confirmed that direct Responses returned
+  `cache_write_tokens=3208` and then `cached_tokens=3208` for `input_tokens=3210`.
+  After restarting the latest proxy and LiteLLM code, the same behavior reached
+  an external Chat Completions client as `usage.prompt_tokens_details`, without
+  changing the token counts.
 - Early events (`response.created`, `response.in_progress`) carry `usage: null`.
   A stream truncated by `max_output_tokens` terminates with
   `response.incomplete` and **never emits `response.completed`** — the usage
